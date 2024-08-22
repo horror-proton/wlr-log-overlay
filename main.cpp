@@ -12,6 +12,59 @@
 
 #include "wlr-layer-shell-unstable-v1.h"
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+FT_Library g_ft_library;
+FT_Face g_ft_face;
+
+inline int init_ft() {
+  FT_Error error = FT_Init_FreeType(&g_ft_library);
+  if (error != 0) {
+    std::printf("failed to init freetype\n");
+    return 1;
+  }
+
+  error = FT_New_Face(g_ft_library,
+                      "/usr/share/fonts/sarasa-gothic/Sarasa-Regular.ttc", 20,
+                      &g_ft_face);
+
+  error = FT_Set_Pixel_Sizes(g_ft_face, 0, 16);
+
+  if (error != 0) {
+    std::printf("failed to load font face\n");
+    return 1;
+  }
+
+  return 0;
+}
+
+inline int render_mono_argb(uint32_t *out_buf, int buf_width, int buf_height,
+                            char code, int anchor_x, int anchor_y,
+                            uint8_t alpha = 0xff) {
+  auto error = FT_Load_Char(g_ft_face, code, FT_LOAD_RENDER);
+  if (error != 0) {
+    std::printf("failed to load glyph\n");
+    return 1;
+  }
+
+  auto *glyph = g_ft_face->glyph;
+  for (int r = 0; r < glyph->bitmap.rows; ++r) {
+    for (int c = 0; c < glyph->bitmap.width; ++c) {
+      const int buf_x = c + anchor_x + glyph->bitmap_left;
+      const int buf_y = r + anchor_y - glyph->bitmap_top;
+      auto *p = &out_buf[buf_y * buf_width + buf_x];
+      const uint32_t value =
+          static_cast<uint32_t>(
+              glyph->bitmap.buffer[r * glyph->bitmap.width + c]) *
+          alpha / 256U;
+      *p = value | (value << 8U) | (value << 16U) | (value << 24U);
+    }
+  }
+
+  return 0;
+}
+
 int alloc_shm_file(ptrdiff_t size) {
   const char shm_name[] = "/wlo-shm";
   int fd = ::shm_open(shm_name, O_RDWR | O_CREAT, 0600);
@@ -163,13 +216,10 @@ int main() {
       std::printf("failed to allocate shm file\n");
       return 1;
     }
-    auto *pool_data = static_cast<uint8_t *>(
-        mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
+    auto *pool_data = static_cast<uint8_t *>(::mmap(
+        nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
 
     auto *pool = wl_shm_create_pool(client_state.shm, shm_fd, shm_size);
-
-    std::printf("pool: %p\n", (void *)pool);
-    std::printf("data: %p\n", (void *)pool_data);
 
     int index = 0;
     int offset = height * stride * index;
@@ -179,15 +229,19 @@ int main() {
 
     ::memset(pool_data, 0x00, stride * height * 2);
 
+    if (init_ft() != 0)
+      return 1;
+
     uint32_t *pixels = (uint32_t *)&pool_data[offset];
-    for (int y = 0; y < height; ++y) {
-      for (int x = 0; x < width; ++x) {
-        if ((x + y / 8 * 8) % 16 < 8) {
-          pixels[y * width + x] = 0x08060606;
-        } else {
-          pixels[y * width + x] = 0x08080808;
-        }
-      }
+    int x = 0;
+    render_mono_argb(pixels, width, height, 'H', x += 10, 20);
+    render_mono_argb(pixels, width, height, 'e', x += 10, 20);
+    render_mono_argb(pixels, width, height, 'l', x += 10, 20);
+    render_mono_argb(pixels, width, height, 'l', x += 10, 20);
+    render_mono_argb(pixels, width, height, 'o', x += 10, 20, 0x80);
+
+    for (int i = 0; i < width; ++i) {
+      pixels[i] = 0xff0000ff;
     }
 
     wl_surface_attach(client_state.layer_surface.surface, buffer, 0, 0);

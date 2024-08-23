@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
@@ -8,6 +9,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/poll.h>
 #include <unistd.h>
 
 #include "wlr-layer-shell-unstable-v1.h"
@@ -65,13 +67,24 @@ inline int render_mono_argb(uint32_t *out_buf, int buf_width, int buf_height,
   return 0;
 }
 
+inline int render_line(uint32_t *out_buf, int buf_width, int buf_height,
+                       const char *line, int anchor_y, uint8_t alpha = 0xff) {
+  int x = 0;
+  for (const char *p = line; *p != '\0'; ++p) {
+    render_mono_argb(out_buf, buf_width, buf_height, *p, x, anchor_y, alpha);
+    x += 10;
+    if (x >= buf_width)
+      break;
+  }
+  return 0;
+}
+
 int alloc_shm_file(ptrdiff_t size) {
-  const char shm_name[] = "/wlo-shm";
-  int fd = ::shm_open(shm_name, O_RDWR | O_CREAT, 0600);
+  int fd = ::memfd_create("wlo-shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+
   if (fd < 0)
     return -1;
 
-  ::shm_unlink(shm_name);
   if (::ftruncate(fd, size) < 0) {
     ::close(fd);
     return -1;
@@ -122,6 +135,10 @@ int main() {
                  uint32_t width, uint32_t height) {
                 std::printf("%s: %d %d %d\n", "layer_surface::configure",
                             serial, width, height);
+                if (width != 200 || height != 200) {
+                  std::printf("unexpected width or height\n");
+                  return;
+                }
                 zwlr_layer_surface_v1_ack_configure(surface, serial);
               },
           .closed =
@@ -131,7 +148,10 @@ int main() {
               },
       };
 
-      zwlr_layer_surface_v1_set_size(overlay_surface, 100, 100);
+      zwlr_layer_surface_v1_set_anchor(overlay_surface,
+                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                                           ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+      zwlr_layer_surface_v1_set_size(overlay_surface, 200, 200);
       zwlr_layer_surface_v1_add_listener(overlay_surface,
                                          &layer_surface_listener, nullptr);
       wl_surface_commit(surf);
@@ -207,8 +227,8 @@ int main() {
   wl_display_roundtrip(display);
 
   {
-    const int width = 100;
-    const int height = 100;
+    const int width = 200;
+    const int height = 200;
     const int stride = width * 4;
     const int shm_size = stride * height * 2;
     int shm_fd = alloc_shm_file(shm_size);
@@ -221,34 +241,71 @@ int main() {
 
     auto *pool = wl_shm_create_pool(client_state.shm, shm_fd, shm_size);
 
-    int index = 0;
-    int offset = height * stride * index;
+    wl_buffer *pbufs[2];
 
-    auto *buffer = wl_shm_pool_create_buffer(pool, offset, width, height,
-                                             stride, WL_SHM_FORMAT_ARGB8888);
-
-    ::memset(pool_data, 0x00, stride * height * 2);
+    for (int i = 0; i < 2; ++i)
+      pbufs[i] =
+          wl_shm_pool_create_buffer(pool, height * stride * i, width, height,
+                                    stride, WL_SHM_FORMAT_ARGB8888);
 
     if (init_ft() != 0)
       return 1;
 
-    uint32_t *pixels = (uint32_t *)&pool_data[offset];
-    int x = 0;
-    render_mono_argb(pixels, width, height, 'H', x += 10, 20);
-    render_mono_argb(pixels, width, height, 'e', x += 10, 20);
-    render_mono_argb(pixels, width, height, 'l', x += 10, 20);
-    render_mono_argb(pixels, width, height, 'l', x += 10, 20);
-    render_mono_argb(pixels, width, height, 'o', x += 10, 20, 0x80);
+    int back_index = 0;
+    int anchor_y = 20;
+    wl_surface *surface = client_state.layer_surface.surface;
+    for (;;) {
+      const int offset = height * stride * back_index;
+      const int buf_size = height * stride;
+      wl_buffer *pbuf = pbufs[back_index];
+      uint8_t *buf_data = &pool_data[offset];
+      uint32_t *pixels = (uint32_t *)buf_data;
 
-    for (int i = 0; i < width; ++i) {
-      pixels[i] = 0xff0000ff;
+      std::string text = "A now";
+      text[0] = 'A' + back_index;
+
+      bool scrolled = false;
+      anchor_y += 16;
+      if (anchor_y >= height - 16) {
+        anchor_y = 20;
+        scrolled = true;
+        std::printf("scrolled\n");
+      }
+
+      ::memset(buf_data, 0x00, buf_size);
+      render_line(pixels, width, height, text.c_str(), anchor_y, 0x10);
+      const int damaged_x = 0;
+      const int damaged_y = anchor_y - 16;
+      const int damaged_width = width;
+      const int damaged_height = 2 * 16;
+
+      wl_surface_attach(surface, pbuf, 0, 0);
+      wl_surface_damage_buffer(surface, damaged_x, damaged_y, damaged_width,
+                               damaged_height);
+      if (scrolled)
+        wl_surface_damage_buffer(surface, 0, 0, width, height);
+      wl_surface_commit(surface);
+      while (wl_display_flush(display) < 0) {
+        if (errno != EAGAIN) {
+          std::printf("flush failed: %s\n", strerror(errno));
+          return -1;
+        }
+        struct pollfd fds[] = {
+            {.fd = wl_display_get_fd(display), .events = POLLIN},
+        };
+        int ret = ::poll(fds, 1, -1);
+
+        std::printf("poll returns %d\n", ret);
+        if (ret < 0) {
+          if (errno == EINTR)
+            continue;
+          std::printf("failed to poll\n");
+        }
+      }
+      back_index = 1 - back_index;
+      // TODO: libwayland: data too big for buffer if we flush too frequently
+      ::sleep(1);
     }
-
-    wl_surface_attach(client_state.layer_surface.surface, buffer, 0, 0);
-    wl_surface_damage(client_state.layer_surface.surface, 0, 0, width, height);
-    wl_surface_commit(client_state.layer_surface.surface);
-    wl_display_flush(display);
-    ::getchar();
   }
 
   wl_registry_destroy(registry);

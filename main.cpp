@@ -68,9 +68,10 @@ inline int render_mono_argb(uint32_t *out_buf, int buf_width, int buf_height,
 }
 
 inline int render_line(uint32_t *out_buf, int buf_width, int buf_height,
-                       const char *line, int anchor_y, uint8_t alpha = 0xff) {
+                       const char *line, size_t line_size, int anchor_y,
+                       uint8_t alpha = 0xff) {
   int x = 0;
-  for (const char *p = line; *p != '\0'; ++p) {
+  for (const char *p = line; p != line + line_size; ++p) {
     render_mono_argb(out_buf, buf_width, buf_height, *p, x, anchor_y, alpha);
     x += 10;
     if (x >= buf_width)
@@ -254,6 +255,10 @@ int main() {
     int back_index = 0;
     int anchor_y = 20;
     wl_surface *surface = client_state.layer_surface.surface;
+
+    char *linebuf = nullptr;
+    size_t linebuf_size = 0;
+
     for (;;) {
       const int offset = height * stride * back_index;
       const int buf_size = height * stride;
@@ -272,8 +277,14 @@ int main() {
         std::printf("scrolled\n");
       }
 
+      const ssize_t read_cnt = ::getline(&linebuf, &linebuf_size, stdin);
+      if (read_cnt < 0) {
+        std::printf("failed to read line, %s\n", strerror(errno));
+        return -1;
+      }
+
       ::memset(buf_data, 0x00, buf_size);
-      render_line(pixels, width, height, text.c_str(), anchor_y, 0x10);
+      render_line(pixels, width, height, linebuf, read_cnt, anchor_y, 0x10);
       const int damaged_x = 0;
       const int damaged_y = anchor_y - 16;
       const int damaged_width = width;
@@ -294,8 +305,6 @@ int main() {
             {.fd = wl_display_get_fd(display), .events = POLLIN},
         };
         int ret = ::poll(fds, 1, -1);
-
-        std::printf("poll returns %d\n", ret);
         if (ret < 0) {
           if (errno == EINTR)
             continue;
@@ -304,8 +313,8 @@ int main() {
       }
       back_index = 1 - back_index;
       // TODO: libwayland: data too big for buffer if we flush too frequently
-      ::sleep(1);
     }
+    ::free(linebuf);
   }
 
   wl_registry_destroy(registry);
